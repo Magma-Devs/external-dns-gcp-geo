@@ -1,4 +1,4 @@
-# external-dns-gcp-geo
+# ExternalDNS GCP Geo routing policies
 
 ExternalDNS-like support for GCP geo-routed DNS policies. This application watches Kubernetes Ingresses and automatically creates or updates geo-routed DNS records in Google Cloud DNS.
 
