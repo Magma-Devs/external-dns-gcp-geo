@@ -1,10 +1,14 @@
 import os
 import logging
 import sys
+import json
 from typing import Optional, Dict, Any
 from kubernetes import client, config, watch
 from google.cloud import dns
 from google.api_core import exceptions as gcp_exceptions
+from google.auth import default
+from google.auth.transport.requests import Request
+import requests
 
 # Configure logging
 logging.basicConfig(
@@ -49,8 +53,18 @@ def validate_env_vars() -> Dict[str, str]:
 # Global configuration
 try:
     CONFIG = validate_env_vars()
+    # Initialize credentials for direct API access
+    credentials, project = default()
+    if not credentials.valid:
+        credentials.refresh(Request())
+    
+    # Keep the original client for zone validation
     dns_client = dns.Client(project=CONFIG['GCP_PROJECT'])
     zone = dns_client.zone(CONFIG['DNS_ZONE_NAME'])
+    
+    # API endpoint for direct calls
+    API_BASE = "https://dns.googleapis.com/dns/v1"
+    
 except Exception as e:
     logger.error(f"Failed to initialize GCP DNS client: {e}")
     sys.exit(1)
@@ -72,63 +86,67 @@ def get_lb_ip(ingress: client.V1Ingress) -> Optional[str]:
         return None
 
 def create_or_update_geo_record(ip: str) -> bool:
-    """Create or update geo-routed DNS record."""
+    """Create or update geo-routed DNS record using direct API."""
     try:
-        # Create the new geo-routed record with placeholder rrdata (will be overridden by routing policy)
-        geo_set = zone.resource_record_set(
-            CONFIG['DNS_RECORD_NAME'], 
-            'A', 
-            CONFIG['TTL'],
-            [ip]  # Placeholder - routing policy will override this
-        )
+        # Refresh credentials if needed
+        if not credentials.valid:
+            credentials.refresh(Request())
         
-        # Set up geo-routing policy to match the exact API format
-        geo_set.routing_policy = {
-            "geo": {
-                "enableFencing": False,
-                "items": [
-                    {
-                        "location": CONFIG['GEO_LOCATION'],
-                        "rrdatas": [ip]
-                    }
-                ]
+        access_token = credentials.token
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Check if record exists first
+        list_url = f"{API_BASE}/projects/{CONFIG['GCP_PROJECT']}/managedZones/{CONFIG['DNS_ZONE_NAME']}/rrsets"
+        list_response = requests.get(list_url, headers=headers)
+        
+        existing_record = None
+        if list_response.status_code == 200:
+            rrsets = list_response.json().get('rrsets', [])
+            for rrset in rrsets:
+                if rrset.get('name') == CONFIG['DNS_RECORD_NAME'] and rrset.get('type') == 'A':
+                    existing_record = rrset
+                    break
+        
+        # Prepare the record data using direct API format
+        record_data = {
+            "name": CONFIG['DNS_RECORD_NAME'],
+            "type": "A",
+            "ttl": CONFIG['TTL'],
+            "routingPolicy": {
+                "geo": {
+                    "enableFencing": False,
+                    "items": [
+                        {
+                            "location": CONFIG['GEO_LOCATION'],
+                            "rrdatas": [ip]
+                        }
+                    ]
+                }
             }
         }
-
-        # Check if record exists by filtering instead of listing all records
-        existing_record = None
-        try:
-            # Try to get the specific record
-            for record in zone.list_resource_record_sets():
-                if record.name == CONFIG['DNS_RECORD_NAME'] and record.record_type == 'A':
-                    existing_record = record
-                    break
-        except Exception as e:
-            logger.warning(f"Failed to check existing records: {e}")
-
-        # Create the change set
-        changes = zone.changes()
         
+        # Create or update the record
         if existing_record:
-            logger.info(f"Updating existing record {existing_record.name}")
-            changes.delete_record_set(existing_record)
+            logger.info(f"Updating existing record {CONFIG['DNS_RECORD_NAME']}")
+            # For updates, use PATCH method
+            update_url = f"{API_BASE}/projects/{CONFIG['GCP_PROJECT']}/managedZones/{CONFIG['DNS_ZONE_NAME']}/rrsets/{CONFIG['DNS_RECORD_NAME']}/A"
+            response = requests.patch(update_url, headers=headers, json=record_data)
         else:
             logger.info(f"Creating new geo-routed DNS record for {CONFIG['DNS_RECORD_NAME']}")
+            # For creation, use POST method
+            create_url = f"{API_BASE}/projects/{CONFIG['GCP_PROJECT']}/managedZones/{CONFIG['DNS_ZONE_NAME']}/rrsets"
+            response = requests.post(create_url, headers=headers, json=record_data)
         
-        changes.add_record_set(geo_set)
-        
-        # Apply changes with retry logic
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                changes.create()
-                logger.info(f"Successfully {'updated' if existing_record else 'created'} geo-routed DNS record to IP {ip}")
-                return True
-            except gcp_exceptions.GoogleAPIError as e:
-                if attempt == max_retries - 1:
-                    logger.error(f"Failed to update DNS record after {max_retries} attempts: {e}")
-                    return False
-                logger.warning(f"DNS update attempt {attempt + 1} failed, retrying: {e}")
+        # Handle the response
+        if response.status_code in [200, 201]:
+            logger.info(f"Successfully {'updated' if existing_record else 'created'} geo-routed DNS record to IP {ip}")
+            return True
+        else:
+            logger.error(f"Failed to {'update' if existing_record else 'create'} DNS record. Status: {response.status_code}, Response: {response.text}")
+            return False
                 
     except Exception as e:
         logger.error(f"Failed to create/update geo-routed DNS record: {e}")
