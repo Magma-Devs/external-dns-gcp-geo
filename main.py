@@ -86,7 +86,7 @@ def get_lb_ip(ingress: client.V1Ingress) -> Optional[str]:
         return None
 
 def create_or_update_geo_record(ip: str) -> bool:
-    """Create or update geo-routed DNS record using direct API."""
+    """Create or update geo-routed DNS record using direct API, merging with existing geo items."""
     try:
         # Refresh credentials if needed
         if not credentials.valid:
@@ -110,7 +110,32 @@ def create_or_update_geo_record(ip: str) -> bool:
                     existing_record = rrset
                     break
         
-        # Prepare the record data using direct API format
+        # Prepare geo items - merge with existing if record exists
+        geo_items = []
+        current_location_item = {
+            "location": CONFIG['GEO_LOCATION'],
+            "rrdatas": [ip]
+        }
+        
+        if existing_record and existing_record.get('routingPolicy', {}).get('geo', {}).get('items'):
+            # Merge with existing geo items, updating current location or adding if new
+            existing_items = existing_record['routingPolicy']['geo']['items']
+            
+            # Keep all existing items except for current location
+            for item in existing_items:
+                if item.get('location') != CONFIG['GEO_LOCATION']:
+                    geo_items.append(item)
+                    
+            # Add current location item (updated)
+            geo_items.append(current_location_item)
+            
+            logger.info(f"Merging geo-location '{CONFIG['GEO_LOCATION']}' with {len(existing_items)} existing geo items")
+        else:
+            # No existing record or no geo routing policy, create new
+            geo_items = [current_location_item]
+            logger.info(f"Creating new geo-routed record for location '{CONFIG['GEO_LOCATION']}'")
+        
+        # Prepare the complete record data
         record_data = {
             "name": CONFIG['DNS_RECORD_NAME'],
             "type": "A",
@@ -118,15 +143,14 @@ def create_or_update_geo_record(ip: str) -> bool:
             "routingPolicy": {
                 "geo": {
                     "enableFencing": False,
-                    "items": [
-                        {
-                            "location": CONFIG['GEO_LOCATION'],
-                            "rrdatas": [ip]
-                        }
-                    ]
+                    "items": geo_items
                 }
             }
         }
+        
+        # Log the geo locations being set
+        locations = [item['location'] for item in geo_items]
+        logger.info(f"Setting geo-routed DNS record with locations: {', '.join(locations)}")
         
         # Create or update the record
         if existing_record:
@@ -142,7 +166,7 @@ def create_or_update_geo_record(ip: str) -> bool:
         
         # Handle the response
         if response.status_code in [200, 201]:
-            logger.info(f"Successfully {'updated' if existing_record else 'created'} geo-routed DNS record to IP {ip}")
+            logger.info(f"Successfully {'updated' if existing_record else 'created'} geo-routed DNS record with IP {ip} for location {CONFIG['GEO_LOCATION']}")
             return True
         else:
             logger.error(f"Failed to {'update' if existing_record else 'create'} DNS record. Status: {response.status_code}, Response: {response.text}")
