@@ -168,48 +168,56 @@ def setup_kubernetes_client() -> client.NetworkingV1Api:
     return client.NetworkingV1Api()
 
 def watch_ingresses():
-    """Watch Kubernetes ingresses for changes."""
+    """Watch Kubernetes ingresses for changes with automatic reconnection."""
     v1_api = setup_kubernetes_client()
-    w = watch.Watch()
     
     logger.info(f"Starting to watch ingresses with label selector: {CONFIG['LABEL_SELECTOR']}")
     
-    try:
-        for event in w.stream(
-            v1_api.list_ingress_for_all_namespaces,
-            label_selector=CONFIG['LABEL_SELECTOR']
-        ):
-            try:
-                ingress = event['object']
-                namespace = ingress.metadata.namespace
-                ingress_name = ingress.metadata.name
-                event_type = event['type']
-                
-                logger.info(f"Event: {event_type} Ingress: {namespace}/{ingress_name}")
-
-                if event_type in ['ADDED', 'MODIFIED']:
-                    lb_ip = get_lb_ip(ingress)
-                    if lb_ip:
-                        logger.info(f"Load Balancer IP detected: {lb_ip}")
-                        success = create_or_update_geo_record(lb_ip)
-                        if not success:
-                            logger.error(f"Failed to update DNS record for {namespace}/{ingress_name}")
-                    else:
-                        logger.debug(f"No Load Balancer IP available for {namespace}/{ingress_name}")
-                elif event_type == 'DELETED':
-                    logger.info(f"Ingress {namespace}/{ingress_name} was deleted")
-                    # Note: We don't automatically delete DNS records on ingress deletion
-                    # as other ingresses might be using the same record
+    while True:
+        w = watch.Watch()
+        try:
+            logger.info("Starting/Restarting watch stream...")
+            for event in w.stream(
+                v1_api.list_ingress_for_all_namespaces,
+                label_selector=CONFIG['LABEL_SELECTOR'],
+                timeout_seconds=300  # 5 minutes timeout
+            ):
+                try:
+                    ingress = event['object']
+                    namespace = ingress.metadata.namespace
+                    ingress_name = ingress.metadata.name
+                    event_type = event['type']
                     
-            except Exception as e:
-                logger.error(f"Error processing ingress event: {e}")
-                continue
-                
-    except Exception as e:
-        logger.error(f"Error watching ingresses: {e}")
-        sys.exit(1)
-    finally:
-        w.stop()
+                    logger.info(f"Event: {event_type} Ingress: {namespace}/{ingress_name}")
+
+                    if event_type in ['ADDED', 'MODIFIED']:
+                        lb_ip = get_lb_ip(ingress)
+                        if lb_ip:
+                            logger.info(f"Load Balancer IP detected: {lb_ip}")
+                            success = create_or_update_geo_record(lb_ip)
+                            if not success:
+                                logger.error(f"Failed to update DNS record for {namespace}/{ingress_name}")
+                        else:
+                            logger.debug(f"No Load Balancer IP available for {namespace}/{ingress_name}")
+                    elif event_type == 'DELETED':
+                        logger.info(f"Ingress {namespace}/{ingress_name} was deleted")
+                        # Note: We don't automatically delete DNS records on ingress deletion
+                        # as other ingresses might be using the same record
+                        
+                except Exception as e:
+                    logger.error(f"Error processing ingress event: {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.warning(f"Watch stream ended: {e}")
+            logger.info("Reconnecting in 5 seconds...")
+            import time
+            time.sleep(5)
+        finally:
+            try:
+                w.stop()
+            except:
+                pass
 
 if __name__ == "__main__":
     try:
