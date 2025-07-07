@@ -91,7 +91,7 @@ def create_or_update_geo_record(ip: str) -> bool:
         existing_record = None
         try:
             # Try to get the specific record
-            for record in zone.list_resource_record_sets(name=CONFIG['DNS_RECORD_NAME']):
+            for record in zone.list_resource_record_sets():
                 if record.name == CONFIG['DNS_RECORD_NAME'] and record.record_type == 'A':
                     existing_record = record
                     break
