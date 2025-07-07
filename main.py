@@ -74,16 +74,24 @@ def get_lb_ip(ingress: client.V1Ingress) -> Optional[str]:
 def create_or_update_geo_record(ip: str) -> bool:
     """Create or update geo-routed DNS record."""
     try:
-        # Create the new geo-routed record
+        # Create the new geo-routed record with placeholder rrdata (will be overridden by routing policy)
         geo_set = zone.resource_record_set(
             CONFIG['DNS_RECORD_NAME'], 
             'A', 
-            CONFIG['TTL'], 
-            [ip]
+            CONFIG['TTL'],
+            [ip]  # Placeholder - routing policy will override this
         )
+        
+        # Set up geo-routing policy to match the exact API format
         geo_set.routing_policy = {
             "geo": {
-                CONFIG['GEO_LOCATION']: [ip]
+                "enableFencing": False,
+                "items": [
+                    {
+                        "location": CONFIG['GEO_LOCATION'],
+                        "rrdatas": [ip]
+                    }
+                ]
             }
         }
 
