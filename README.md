@@ -6,9 +6,28 @@ ExternalDNS-like support for GCP geo-routed DNS policies. This application watch
 
 - 🌍 **Geo-routing**: Automatically creates geo-routed DNS records based on ingress load balancer IPs
 - 🔄 **Real-time updates**: Watches Kubernetes ingresses for changes and updates DNS records accordingly
+- 🌐 **Multi-cluster support**: Intelligent merging of geo-location items across multiple clusters
+- 🔌 **Direct REST API**: Uses Cloud DNS REST API for full routing policy support (Python SDK limitations bypassed)
+- 🔄 **Auto-reconnection**: Automatic reconnection for watch streams to prevent pod restarts
 - 🛡️ **Robust error handling**: Comprehensive error handling with retry logic and proper logging
 - 📊 **Production ready**: Includes health checks, structured logging, and security best practices
 - 🔒 **Security**: Runs as non-root user with minimal privileges
+
+## Architecture
+
+This application is designed to work across multiple Kubernetes clusters to provide geo-distributed DNS routing:
+
+- **Multi-cluster deployment**: Each cluster runs its own instance with a unique `GEO_LOCATION`
+- **Intelligent merging**: When updating DNS records, the application preserves geo-location items from other clusters
+- **Direct API usage**: Uses Cloud DNS REST API directly to support routing policies (Python SDK lacks this feature)
+- **Automatic recovery**: Watch streams automatically reconnect to prevent service disruption
+
+### Multi-Cluster Flow
+
+1. Each cluster's external-dns-gcp-geo instance watches local ingresses
+2. When an ingress gets a load balancer IP, the instance updates the shared DNS record
+3. The application merges its geo-location with existing ones from other clusters
+4. Result: A single DNS record with multiple geo-routing destinations
 
 ## Prerequisites
 
@@ -32,11 +51,17 @@ ExternalDNS-like support for GCP geo-routed DNS policies. This application watch
 
 ### GCP Authentication
 
-The application uses Google Cloud client libraries and supports the following authentication methods:
+The application uses Google Cloud authentication libraries and supports the following authentication methods:
 
 1. **Service Account Key**: Mount service account JSON key and set `GOOGLE_APPLICATION_CREDENTIALS`
 2. **Workload Identity**: Use GKE Workload Identity (recommended)
 3. **Metadata Service**: Use GCE metadata service if running on GCE
+
+The application automatically handles credential refreshing for long-running operations. When making REST API calls, it:
+
+- Uses the default credential chain to obtain credentials
+- Automatically refreshes expired tokens
+- Includes proper `Authorization: Bearer <token>` headers for all API calls
 
 ## Deployment
 
@@ -61,7 +86,7 @@ spec:
       serviceAccountName: external-dns-gcp-geo
       containers:
       - name: external-dns-gcp-geo
-        image: ghcr.io/yourusername/external-dns-gcp-geo:latest
+        image: ghcr.io/magma-devs/external-dns-gcp-geo:latest
         env:
         - name: GCP_PROJECT
           value: "your-project-id"
@@ -171,9 +196,18 @@ spec:
 
 For multi-region setups, deploy the application in each region with different `GEO_LOCATION` values:
 
-- Region 1: `GEO_LOCATION=us`
-- Region 2: `GEO_LOCATION=eu`
-- Region 3: `GEO_LOCATION=asia`
+- Region 1: `GEO_LOCATION=us-central1`
+- Region 2: `GEO_LOCATION=europe-west1`
+- Region 3: `GEO_LOCATION=asia-southeast1`
+
+**Important**: All instances can start in any order and will intelligently merge their geo-location data. When an instance updates the DNS record, it:
+
+1. Retrieves the current record (if it exists)
+2. Preserves all existing geo-location items from other clusters
+3. Updates only its own geo-location with the new IP
+4. Saves the merged record back to Cloud DNS
+
+This ensures that DNS records remain consistent across all regions, even if clusters are restarted or updated independently.
 
 ## Monitoring
 
@@ -181,10 +215,17 @@ For multi-region setups, deploy the application in each region with different `G
 
 The application uses structured logging with the following levels:
 
-- `INFO`: Normal operations, ingress events, DNS updates
-- `WARNING`: Recoverable errors, retries
-- `ERROR`: Critical errors, failed DNS updates
-- `DEBUG`: Detailed debugging information
+- `INFO`: Normal operations, ingress events, DNS updates, geo-location merging
+- `WARNING`: Recoverable errors, watch stream timeouts, API retries
+- `ERROR`: Critical errors, failed DNS updates, authentication failures
+- `DEBUG`: Detailed debugging information, missing load balancer IPs
+
+Key log messages to monitor:
+
+- `Successfully created/updated geo-routed DNS record` - DNS update success
+- `Merging geo-location 'region' with N existing geo items` - Multi-cluster coordination
+- `Starting/Restarting watch stream` - Stream reconnection events
+- `Load Balancer IP detected` - Ingress processing
 
 ### Health Check
 
@@ -225,6 +266,56 @@ Consider adding Prometheus metrics for:
    ```
    Solution: Wait for ingress controller to assign IP or check ingress configuration
 
+5. **API authentication errors**
+   ```
+   ERROR - Failed to create/update geo-routed DNS record: 401 Unauthorized
+   ```
+   Solution: Check GCP credentials and ensure the service account has `roles/dns.admin` permissions
+
+6. **Watch stream timeouts**
+   ```
+   WARNING - Watch stream ended: TimeoutError
+   INFO - Reconnecting in 5 seconds...
+   ```
+   Solution: This is normal behavior. The application automatically reconnects every 5 minutes or when the stream fails
+
+7. **Geo-location conflicts**
+   ```
+   INFO - Merging geo-location 'us-central1' with 2 existing geo items
+   ```
+   Solution: This is expected behavior when multiple clusters update the same DNS record. Each cluster manages its own geo-location.
+
+## Implementation Details
+
+### Why REST API instead of Python SDK?
+
+The Google Cloud DNS Python SDK doesn't support routing policies, which are essential for geo-routing. This application uses the Cloud DNS REST API directly to:
+
+- Create and update DNS records with geo-routing policies
+- Support all geo-location codes available in Cloud DNS
+- Provide full control over routing policy configuration
+
+### DNS Record Format
+
+The application creates DNS records with the following structure:
+
+```json
+{
+  "name": "*.example.com.",
+  "type": "A", 
+  "ttl": 300,
+  "routingPolicy": {
+    "geo": {
+      "enableFencing": false,
+      "items": [
+        {"location": "us-central1", "rrdatas": ["35.224.7.189"]},
+        {"location": "europe-west1", "rrdatas": ["35.224.7.188"]}
+      ]
+    }
+  }
+}
+```
+
 ## Security Considerations
 
 - Application runs as non-root user
@@ -232,6 +323,17 @@ Consider adding Prometheus metrics for:
 - Read-only root filesystem
 - Follows principle of least privilege for GCP permissions
 - Uses Workload Identity when possible
+
+## Dependencies
+
+The application uses the following key Python packages:
+
+- `kubernetes>=29.0.0`: For Kubernetes API access and watching ingresses
+- `google-cloud-dns>=0.34.0`: For initial DNS zone validation
+- `google-auth>=2.0.0`: For GCP authentication and token management
+- `requests>=2.25.0`: For direct REST API calls to Cloud DNS
+
+See `requirements.txt` for complete dependency list.
 
 ## Related Projects
 
