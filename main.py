@@ -1,10 +1,14 @@
 import os
 import logging
 import sys
+import json
 from typing import Optional, Dict, Any
 from kubernetes import client, config, watch
 from google.cloud import dns
 from google.api_core import exceptions as gcp_exceptions
+from google.auth import default
+from google.auth.transport.requests import Request
+import requests
 
 # Configure logging
 logging.basicConfig(
@@ -49,8 +53,18 @@ def validate_env_vars() -> Dict[str, str]:
 # Global configuration
 try:
     CONFIG = validate_env_vars()
+    # Initialize credentials for direct API access
+    credentials, project = default()
+    if not credentials.valid:
+        credentials.refresh(Request())
+    
+    # Keep the original client for zone validation
     dns_client = dns.Client(project=CONFIG['GCP_PROJECT'])
     zone = dns_client.zone(CONFIG['DNS_ZONE_NAME'])
+    
+    # API endpoint for direct calls
+    API_BASE = "https://dns.googleapis.com/dns/v1"
+    
 except Exception as e:
     logger.error(f"Failed to initialize GCP DNS client: {e}")
     sys.exit(1)
@@ -72,55 +86,91 @@ def get_lb_ip(ingress: client.V1Ingress) -> Optional[str]:
         return None
 
 def create_or_update_geo_record(ip: str) -> bool:
-    """Create or update geo-routed DNS record."""
+    """Create or update geo-routed DNS record using direct API, merging with existing geo items."""
     try:
-        # Create the new geo-routed record
-        geo_set = zone.resource_record_set(
-            CONFIG['DNS_RECORD_NAME'], 
-            'A', 
-            CONFIG['TTL'], 
-            [ip]
-        )
-        geo_set.routing_policy = {
-            "geo": {
-                CONFIG['GEO_LOCATION']: [ip]
+        # Refresh credentials if needed
+        if not credentials.valid:
+            credentials.refresh(Request())
+        
+        access_token = credentials.token
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Check if record exists first
+        list_url = f"{API_BASE}/projects/{CONFIG['GCP_PROJECT']}/managedZones/{CONFIG['DNS_ZONE_NAME']}/rrsets"
+        list_response = requests.get(list_url, headers=headers)
+        
+        existing_record = None
+        if list_response.status_code == 200:
+            rrsets = list_response.json().get('rrsets', [])
+            for rrset in rrsets:
+                if rrset.get('name') == CONFIG['DNS_RECORD_NAME'] and rrset.get('type') == 'A':
+                    existing_record = rrset
+                    break
+        
+        # Prepare geo items - merge with existing if record exists
+        geo_items = []
+        current_location_item = {
+            "location": CONFIG['GEO_LOCATION'],
+            "rrdatas": [ip]
+        }
+        
+        if existing_record and existing_record.get('routingPolicy', {}).get('geo', {}).get('items'):
+            # Merge with existing geo items, updating current location or adding if new
+            existing_items = existing_record['routingPolicy']['geo']['items']
+            
+            # Keep all existing items except for current location
+            for item in existing_items:
+                if item.get('location') != CONFIG['GEO_LOCATION']:
+                    geo_items.append(item)
+                    
+            # Add current location item (updated)
+            geo_items.append(current_location_item)
+            
+            logger.info(f"Merging geo-location '{CONFIG['GEO_LOCATION']}' with {len(existing_items)} existing geo items")
+        else:
+            # No existing record or no geo routing policy, create new
+            geo_items = [current_location_item]
+            logger.info(f"Creating new geo-routed record for location '{CONFIG['GEO_LOCATION']}'")
+        
+        # Prepare the complete record data
+        record_data = {
+            "name": CONFIG['DNS_RECORD_NAME'],
+            "type": "A",
+            "ttl": CONFIG['TTL'],
+            "routingPolicy": {
+                "geo": {
+                    "enableFencing": False,
+                    "items": geo_items
+                }
             }
         }
-
-        # Check if record exists by filtering instead of listing all records
-        existing_record = None
-        try:
-            # Try to get the specific record
-            for record in zone.list_resource_record_sets(name=CONFIG['DNS_RECORD_NAME']):
-                if record.name == CONFIG['DNS_RECORD_NAME'] and record.record_type == 'A':
-                    existing_record = record
-                    break
-        except Exception as e:
-            logger.warning(f"Failed to check existing records: {e}")
-
-        # Create the change set
-        changes = zone.changes()
         
+        # Log the geo locations being set
+        locations = [item['location'] for item in geo_items]
+        logger.info(f"Setting geo-routed DNS record with locations: {', '.join(locations)}")
+        
+        # Create or update the record
         if existing_record:
-            logger.info(f"Updating existing record {existing_record.name}")
-            changes.delete_record_set(existing_record)
+            logger.info(f"Updating existing record {CONFIG['DNS_RECORD_NAME']}")
+            # For updates, use PATCH method
+            update_url = f"{API_BASE}/projects/{CONFIG['GCP_PROJECT']}/managedZones/{CONFIG['DNS_ZONE_NAME']}/rrsets/{CONFIG['DNS_RECORD_NAME']}/A"
+            response = requests.patch(update_url, headers=headers, json=record_data)
         else:
             logger.info(f"Creating new geo-routed DNS record for {CONFIG['DNS_RECORD_NAME']}")
+            # For creation, use POST method
+            create_url = f"{API_BASE}/projects/{CONFIG['GCP_PROJECT']}/managedZones/{CONFIG['DNS_ZONE_NAME']}/rrsets"
+            response = requests.post(create_url, headers=headers, json=record_data)
         
-        changes.add_record_set(geo_set)
-        
-        # Apply changes with retry logic
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                changes.create()
-                logger.info(f"Successfully {'updated' if existing_record else 'created'} geo-routed DNS record to IP {ip}")
-                return True
-            except gcp_exceptions.GoogleAPIError as e:
-                if attempt == max_retries - 1:
-                    logger.error(f"Failed to update DNS record after {max_retries} attempts: {e}")
-                    return False
-                logger.warning(f"DNS update attempt {attempt + 1} failed, retrying: {e}")
+        # Handle the response
+        if response.status_code in [200, 201]:
+            logger.info(f"Successfully {'updated' if existing_record else 'created'} geo-routed DNS record with IP {ip} for location {CONFIG['GEO_LOCATION']}")
+            return True
+        else:
+            logger.error(f"Failed to {'update' if existing_record else 'create'} DNS record. Status: {response.status_code}, Response: {response.text}")
+            return False
                 
     except Exception as e:
         logger.error(f"Failed to create/update geo-routed DNS record: {e}")
@@ -142,48 +192,56 @@ def setup_kubernetes_client() -> client.NetworkingV1Api:
     return client.NetworkingV1Api()
 
 def watch_ingresses():
-    """Watch Kubernetes ingresses for changes."""
+    """Watch Kubernetes ingresses for changes with automatic reconnection."""
     v1_api = setup_kubernetes_client()
-    w = watch.Watch()
     
     logger.info(f"Starting to watch ingresses with label selector: {CONFIG['LABEL_SELECTOR']}")
     
-    try:
-        for event in w.stream(
-            v1_api.list_ingress_for_all_namespaces,
-            label_selector=CONFIG['LABEL_SELECTOR']
-        ):
-            try:
-                ingress = event['object']
-                namespace = ingress.metadata.namespace
-                ingress_name = ingress.metadata.name
-                event_type = event['type']
-                
-                logger.info(f"Event: {event_type} Ingress: {namespace}/{ingress_name}")
-
-                if event_type in ['ADDED', 'MODIFIED']:
-                    lb_ip = get_lb_ip(ingress)
-                    if lb_ip:
-                        logger.info(f"Load Balancer IP detected: {lb_ip}")
-                        success = create_or_update_geo_record(lb_ip)
-                        if not success:
-                            logger.error(f"Failed to update DNS record for {namespace}/{ingress_name}")
-                    else:
-                        logger.debug(f"No Load Balancer IP available for {namespace}/{ingress_name}")
-                elif event_type == 'DELETED':
-                    logger.info(f"Ingress {namespace}/{ingress_name} was deleted")
-                    # Note: We don't automatically delete DNS records on ingress deletion
-                    # as other ingresses might be using the same record
+    while True:
+        w = watch.Watch()
+        try:
+            logger.info("Starting/Restarting watch stream...")
+            for event in w.stream(
+                v1_api.list_ingress_for_all_namespaces,
+                label_selector=CONFIG['LABEL_SELECTOR'],
+                timeout_seconds=300  # 5 minutes timeout
+            ):
+                try:
+                    ingress = event['object']
+                    namespace = ingress.metadata.namespace
+                    ingress_name = ingress.metadata.name
+                    event_type = event['type']
                     
-            except Exception as e:
-                logger.error(f"Error processing ingress event: {e}")
-                continue
-                
-    except Exception as e:
-        logger.error(f"Error watching ingresses: {e}")
-        sys.exit(1)
-    finally:
-        w.stop()
+                    logger.info(f"Event: {event_type} Ingress: {namespace}/{ingress_name}")
+
+                    if event_type in ['ADDED', 'MODIFIED']:
+                        lb_ip = get_lb_ip(ingress)
+                        if lb_ip:
+                            logger.info(f"Load Balancer IP detected: {lb_ip}")
+                            success = create_or_update_geo_record(lb_ip)
+                            if not success:
+                                logger.error(f"Failed to update DNS record for {namespace}/{ingress_name}")
+                        else:
+                            logger.debug(f"No Load Balancer IP available for {namespace}/{ingress_name}")
+                    elif event_type == 'DELETED':
+                        logger.info(f"Ingress {namespace}/{ingress_name} was deleted")
+                        # Note: We don't automatically delete DNS records on ingress deletion
+                        # as other ingresses might be using the same record
+                        
+                except Exception as e:
+                    logger.error(f"Error processing ingress event: {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.warning(f"Watch stream ended: {e}")
+            logger.info("Reconnecting in 5 seconds...")
+            import time
+            time.sleep(5)
+        finally:
+            try:
+                w.stop()
+            except:
+                pass
 
 if __name__ == "__main__":
     try:
